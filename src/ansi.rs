@@ -563,6 +563,15 @@ pub trait Handler {
     /// Substitute char under cursor.
     fn substitute(&mut self) {}
 
+    /// Called when an APC string starts (ESC _ received).
+    fn apc_start(&mut self) {}
+
+    /// Pass a byte as part of an APC string.
+    fn apc_put(&mut self, _byte: u8) {}
+
+    /// Called when an APC string is terminated or aborted (ST, CAN, SUB, or ESC).
+    fn apc_end(&mut self) {}
+
     /// Newline.
     fn newline(&mut self) {}
 
@@ -1774,6 +1783,21 @@ where
     }
 
     #[inline]
+    #[inline]
+    fn apc_start(&mut self) {
+        self.handler.apc_start();
+    }
+
+    #[inline]
+    fn apc_put(&mut self, byte: u8) {
+        self.handler.apc_put(byte);
+    }
+
+    #[inline]
+    fn apc_end(&mut self) {
+        self.handler.apc_end();
+    }
+
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
         macro_rules! unhandled {
             () => {{

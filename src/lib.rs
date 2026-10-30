@@ -182,6 +182,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             State::EscapeIntermediate => self.advance_esc_intermediate(performer, byte),
             State::OscString => self.advance_osc_string(performer, byte),
             State::SosPmApcString => self.anywhere(performer, byte),
+            State::ApcString => self.advance_apc_string(performer, byte),
             State::Ground => unreachable!(),
         }
     }
@@ -376,7 +377,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.osc_num_params = 0;
                 self.state = State::OscString
             },
-            0x5E..=0x5F => self.state = State::SosPmApcString,
+            0x5E => self.state = State::SosPmApcString,
+            0x5F => {
+                performer.apc_start();
+                self.state = State::ApcString;
+            },
             0x60..=0x7E => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
                 self.state = State::Ground
@@ -433,6 +438,29 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.action_osc_put_param()
             },
             _ => self.action_osc_put(byte),
+        }
+    }
+
+    #[inline(always)]
+    fn advance_apc_string<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            0x00..=0x17 | 0x19 | 0x1C..=0x7E => performer.apc_put(byte),
+            0x18 | 0x1A => {
+                performer.apc_end();
+                performer.execute(byte);
+                self.state = State::Ground;
+            },
+            0x1B => {
+                performer.apc_end();
+                self.reset_params();
+                self.state = State::Escape;
+            },
+            0x7F => {},
+            0x9C => {
+                performer.apc_end();
+                self.state = State::Ground;
+            },
+            _ => {},
         }
     }
 
@@ -751,6 +779,7 @@ enum State {
     EscapeIntermediate,
     OscString,
     SosPmApcString,
+    ApcString,
     #[default]
     Ground,
 }
@@ -818,6 +847,15 @@ pub trait Perform {
     /// subsequent characters were ignored.
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
 
+    /// Called when an APC string starts (ESC _ received).
+    fn apc_start(&mut self) {}
+
+    /// Pass a byte as part of an APC string.
+    fn apc_put(&mut self, _byte: u8) {}
+
+    /// Called when an APC string is terminated or aborted (ST, CAN, SUB, or ESC).
+    fn apc_end(&mut self) {}
+
     /// Whether the parser should terminate prematurely.
     ///
     /// This can be used in conjunction with
@@ -864,6 +902,9 @@ mod tests {
         Print(char),
         Execute(u8),
         DcsUnhook,
+        ApcStart,
+        ApcPut(u8),
+        ApcEnd,
     }
 
     impl Perform for Dispatcher {
@@ -904,6 +945,88 @@ mod tests {
         fn execute(&mut self, byte: u8) {
             self.dispatched.push(Sequence::Execute(byte));
         }
+
+        fn apc_start(&mut self) {
+            self.dispatched.push(Sequence::ApcStart);
+        }
+
+        fn apc_put(&mut self, byte: u8) {
+            self.dispatched.push(Sequence::ApcPut(byte));
+        }
+
+        fn apc_end(&mut self) {
+            self.dispatched.push(Sequence::ApcEnd);
+        }
+    }
+
+    #[test]
+    fn parse_apc_basic() {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+        // ESC _ G q = 1 ; d a t a ESC \
+        let input = b"\x1b_Gq=1;data\x1b\\";
+        for byte in input {
+            parser.advance(&mut dispatcher, &[*byte]);
+        }
+        assert_eq!(dispatcher.dispatched[0], Sequence::ApcStart);
+        assert_eq!(dispatcher.dispatched[1], Sequence::ApcPut(b'G'));
+        assert_eq!(dispatcher.dispatched[2], Sequence::ApcPut(b'q'));
+        let last_apc_idx = dispatcher.dispatched.iter().rposition(|s| *s == Sequence::ApcEnd).unwrap();
+        assert!(last_apc_idx > 0);
+    }
+
+    #[test]
+    fn parse_apc_st_terminator() {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+        let input = b"\x1b_Ghello\x9c";
+        for byte in input {
+            parser.advance(&mut dispatcher, &[*byte]);
+        }
+        assert_eq!(dispatcher.dispatched[0], Sequence::ApcStart);
+        assert!(dispatcher.dispatched.contains(&Sequence::ApcEnd));
+    }
+
+    #[test]
+    fn parse_apc_can_abort() {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+        let input = b"\x1b_Gdata\x18";
+        for byte in input {
+            parser.advance(&mut dispatcher, &[*byte]);
+        }
+        assert!(dispatcher.dispatched.contains(&Sequence::ApcEnd));
+        assert!(dispatcher.dispatched.contains(&Sequence::Execute(0x18)));
+    }
+
+    #[test]
+    fn parse_apc_sub_abort() {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+        let input = b"\x1b_Gdata\x1a";
+        for byte in input {
+            parser.advance(&mut dispatcher, &[*byte]);
+        }
+        assert!(dispatcher.dispatched.contains(&Sequence::ApcEnd));
+        assert!(dispatcher.dispatched.contains(&Sequence::Execute(0x1a)));
+    }
+
+    #[test]
+    fn parse_apc_does_not_affect_sos_pm() {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+        // SOS (0x58) should still go to SosPmApcString (ignored).
+        let input = b"\x1b\x58hello\x9c";
+        for byte in input {
+            parser.advance(&mut dispatcher, &[*byte]);
+        }
+        assert!(!dispatcher.dispatched.contains(&Sequence::ApcStart));
+        // PM (0x5E) similarly.
+        let input2 = b"\x1b\x5ehello\x9c";
+        for byte in input2 {
+            parser.advance(&mut dispatcher, &[*byte]);
+        }
+        assert_eq!(dispatcher.dispatched.iter().filter(|s| **s == Sequence::ApcStart).count(), 0);
     }
 
     #[test]
